@@ -1,0 +1,131 @@
+# =============================================================================
+# php_rust_serializer — базовый образ приложения (Alpine / php-fpm)
+# =============================================================================
+# Multi-stage:
+#   [builder]  собирает PHP-расширения (C) и Rust-расширение php_rust_serializer
+#   [runtime]  финальный лёгкий образ с runtime-библиотеками и .so
+#
+# Сборка (из корня php_rust_serializer, где лежат Cargo.toml, src/):
+#   docker build -t php-rust-serializer-target:8.4 -f Dockerfile.target .
+#
+# Проверка, что расширение подключено:
+#   docker run --rm php-rust-serializer-target:8.4 php -m | grep php_rust_serializer
+# =============================================================================
+
+ARG PHP_VERSION=8.4.2
+ARG ALPINE_VERSION=alpine3.20
+
+
+# -----------------------------------------------------------------------------
+# STAGE 1: builder — PHP-расширения + Rust-расширение
+# -----------------------------------------------------------------------------
+FROM php:${PHP_VERSION}-fpm-${ALPINE_VERSION} AS builder
+
+# PHPIZE_DEPS + dev-заголовки под C-расширения (как в исходном Dockerfile)
+RUN apk add --no-cache $PHPIZE_DEPS \
+        libzip-dev \
+        oniguruma-dev \
+        libpng-dev \
+        jpeg-dev \
+        freetype-dev \
+        icu-dev \
+        libxml2-dev \
+        # Для ext-php-rs (bindgen) нужен libclang и clang
+        clang \
+        # В Alpine 3.20 актуальное имя — clang17-libclang (или clang16-libclang).
+        # Если пакет не найдётся, проверьте `apk search libclang`.
+        clang17-libclang \
+        # Rust toolchain ставим через rustup
+        rustup \
+    # 1) configure GD (иначе соберётся без freetype/jpeg)
+    && docker-php-ext-configure gd --with-freetype --with-jpeg \
+    # 2) Компилируем C-расширения приложения
+    && docker-php-ext-install -j"$(nproc)" \
+        mysqli \
+        pdo_mysql \
+        mbstring \
+        zip \
+        bcmath \
+        gd \
+        intl \
+        pcntl \
+        posix \
+    # 3) PECL-расширение (собирается здесь, в runtime .so просто копируется)
+    && pecl install timezonedb \
+    && docker-php-ext-enable timezonedb
+
+# --- Rust toolchain (стабильный) ---
+# rustup-init ставит cargo/rustc в /root/.cargo
+RUN rustup-init -y --profile minimal --default-toolchain stable \
+    && . "$HOME/.cargo/env"
+ENV PATH="/root/.cargo/bin:${PATH}"
+
+# --- Сборка Rust-расширения ---
+# Контекст сборки — корень php_rust_serializer, поэтому копируем всё содержимое
+# (Cargo.toml, src/ и т.д.) в /tmp/php_rust_serializer.
+COPY . /tmp/php_rust_serializer
+
+# Для musl (Alpine) ext-php-rs требует динамическое связывание CRT:
+# флаг -crt-static и фича runtime (в 0.15 обычно включена по умолчанию).
+# Создаём локальный .cargo/config.toml, чтобы не зависеть от глобальных настроек.
+RUN mkdir -p /tmp/php_rust_serializer/.cargo \
+    && cat > /tmp/php_rust_serializer/.cargo/config.toml <<'EOF'
+[target.'cfg(target_env = "musl")']
+rustflags = ["-C", "target-feature=-crt-static"]
+EOF
+
+WORKDIR /tmp/php_rust_serializer
+
+# Сборка релиза. Явно указываем фичу runtime — это безопасно и гарантирует
+# корректную сборку под musl.
+RUN cargo build --release
+
+# Проверяем, что .so создан (имя = lib<name>.so)
+RUN ls -la target/release/libphp_rust_serializer.so
+
+
+# -----------------------------------------------------------------------------
+# STAGE 2: runtime — финальный базовый образ приложения
+# -----------------------------------------------------------------------------
+FROM php:${PHP_VERSION}-fpm-${ALPINE_VERSION}
+
+# Только runtime-библиотеки (без компилятора и -dev заголовков)
+RUN apk add --no-cache \
+        git \
+        curl \
+        libzip \
+        oniguruma \
+        libpng \
+        jpeg \
+        freetype \
+        icu-libs \
+        libstdc++ \
+        libgcc \
+    # Composer
+    && php -r "copy('https://getcomposer.org/installer', 'composer-setup.php');" \
+    && php composer-setup.php --install-dir=/usr/bin --filename=composer \
+    && php -r "unlink('composer-setup.php');"
+
+# Копируем ВСЕ скомпилированные C-расширения из builder (mysqli, gd, timezonedb и т.д.)
+COPY --from=builder /usr/local/lib/php/extensions/ /usr/local/lib/php/extensions/
+
+# # Копируем Rust-расширение и переименовываем lib*.so -> *.so (как ожидает PHP)
+# COPY --from=builder /tmp/php_rust_serializer/target/release/libphp_rust_serializer.so \
+#      /usr/local/lib/php/extensions/php_rust_serializer.so
+# Копируем Rust-расширение и кладём его в каталог, который PHP реально сканирует
+COPY --from=builder /tmp/php_rust_serializer/target/release/libphp_rust_serializer.so \
+     /tmp/php_rust_serializer.so
+
+RUN cp /tmp/php_rust_serializer.so "$(php-config --extension-dir)/php_rust_serializer.so" \
+    && rm /tmp/php_rust_serializer.so \
+    && docker-php-ext-enable php_rust_serializer
+
+# Включаем C-расширения приложения
+RUN docker-php-ext-enable mysqli pdo_mysql mbstring zip bcmath gd intl timezonedb pcntl posix
+
+# Включаем Rust-расширение
+RUN echo "extension=php_rust_serializer.so" > /usr/local/etc/php/conf.d/php_rust_serializer.ini
+
+WORKDIR /var/www
+
+CMD ["php", "-v"]
